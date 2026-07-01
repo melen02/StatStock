@@ -1,9 +1,6 @@
 import os
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import LogisticRegression, RidgeCV
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import TimeSeriesSplit
 import statsmodels.api as sm
 from loadData.db import get_database
 
@@ -11,17 +8,14 @@ from loadData.db import get_database
 # ── Config ────────────────────────────────────────────────────────────────────
 
 FEATURES = [
-    # Fundamentals
     "GrossMargin",
     "OperatingMargin",
-    "DebtToAssets",         # TotalDebt / TotalAssets (new)
-    # "CashRatio",            # TotalCash / TotalDebt (new)
-    "RevenueGrowth",        # QoQ revenue growth (new)
-    "EPS_Surprise",         # EPS change vs previous quarter (new)
+    "DebtToAssets",
+    "RevenueGrowth",
+    "EPS_Surprise",
     "Beta",
     "MarketCap",
     "FreeCashFlow",
-    # Price-based
     "Momentum_3M",
     "Momentum_6M",
     "Volatility_3M",
@@ -45,29 +39,19 @@ def load_data(db):
     for df in [quarterly, fundamentals, history]:
         df.drop(columns=["_id"], errors="ignore", inplace=True)
 
-    # ── New fundamental features ──
+    # ── Fundamental features ──
     quarterly = quarterly.sort_values(["Ticker", "QuarterDate"])
 
-    # Revenue growth QoQ
     quarterly["RevenueGrowth"] = (
         quarterly.groupby("Ticker")["Revenue"]
         .pct_change(fill_method=None)
     )
-
-    # EPS surprise: change in EPS vs previous quarter
     quarterly["EPS_Surprise"] = (
         quarterly.groupby("Ticker")["EPS_Trailing"]
         .pct_change(fill_method=None)
     )
-
-    # Debt to assets
     quarterly["DebtToAssets"] = (
         quarterly["TotalDebt"] / quarterly["TotalAssets"]
-    ).replace([np.inf, -np.inf], np.nan)
-
-    # Cash ratio
-    quarterly["CashRatio"] = (
-        quarterly["TotalCash"] / quarterly["TotalDebt"]
     ).replace([np.inf, -np.inf], np.nan)
 
     # ── Price-based features ──
@@ -113,7 +97,6 @@ def load_data(db):
     price_snapshot = quarterly.apply(get_price_snapshot, axis=1)
     quarterly = pd.concat([quarterly, price_snapshot], axis=1)
 
-    # ── Merge fundamentals ──
     df = quarterly.merge(
         fundamentals[["Ticker", "Beta", "MarketCap", "Sector"]],
         on="Ticker",
@@ -126,36 +109,24 @@ def load_data(db):
 # ── Dataset builder ───────────────────────────────────────────────────────────
 
 def build_dataset(df):
-    # Reset index first to avoid concat index issues
     df = df.reset_index(drop=True)
 
-    # Only keep columns that actually exist
-    available = [c for c in FEATURES + ["ForwardReturn", "Ticker", "Quarter", "Sector", "QuarterDate"] if c in df.columns]
+    available = [c for c in FEATURES + ["ForwardReturn", "Ticker", "Quarter", "Sector", "QuarterDate"]
+                 if c in df.columns]
     df = df[available].copy()
 
-    # These must exist — drop rows where they're missing
-    required = ["GrossMargin", "OperatingMargin", "Beta",
-                "Volatility_3M", "ForwardReturn"]
+    required = ["GrossMargin", "OperatingMargin", "Beta", "Volatility_3M", "ForwardReturn"]
     required = [c for c in required if c in df.columns]
     df = df.dropna(subset=required)
-    print("NaN counts after required dropna:")
+
+    # Fill non-required features with global median
     for col in FEATURES:
         if col in df.columns:
-            n = df[col].isna().sum()
-            print(f"  {col}: {n} / {len(df)}")
-
-    print(f"After required dropna: {len(df)} rows")
-
-    # Fill remaining missing features with global median (skip sector groupby)
-    for col in FEATURES:
-        if col in df.columns:
-            median_val = df[col].median()
-            df[col] = df[col].fillna(median_val)
+            df[col] = df[col].fillna(df[col].median())
 
     df = df.dropna(subset=[c for c in FEATURES if c in df.columns] + ["ForwardReturn"])
 
-    print(f"After full dropna: {len(df)} rows")
-
+    # Clip outliers
     for col in [c for c in FEATURES if c in df.columns] + ["ForwardReturn"]:
         lo, hi = df[col].quantile(0.01), df[col].quantile(0.99)
         df[col] = df[col].clip(lo, hi)
@@ -178,7 +149,7 @@ def run_ols(X, y):
     return model
 
 
-def ols_results_for_powerbi(model, feature_names):
+def ols_results_for_mongo(model, feature_names):
     params  = model.params[1:]
     pvalues = model.pvalues[1:]
     conf    = model.conf_int().iloc[1:]
@@ -190,100 +161,101 @@ def ols_results_for_powerbi(model, feature_names):
         "CI_Lower":    conf[0].values,
         "CI_Upper":    conf[1].values,
         "Significant": (pvalues < 0.05).values,
+        "R2":          model.rsquared,
+        "AdjR2":       model.rsquared_adj,
     })
-    results["R2"]    = model.rsquared
-    results["AdjR2"] = model.rsquared_adj
     return results
 
 
-# ── Model 2: Ridge with time series CV ───────────────────────────────────────
+# ── Model 2: Fama-MacBeth ─────────────────────────────────────────────────────
 
-def run_ridge_cv(X, y):
+def run_fama_macbeth(X, y, meta):
     """
-    Ridge regression with time series cross-validation.
-    Trains on older quarters, tests on newer ones — more honest than in-sample R².
+    Fama-MacBeth regression:
+    1. For each quarter, run a cross-sectional OLS across all stocks
+    2. Collect the coefficients from each quarter
+    3. Average them and t-test whether they're significantly different from zero
+
+    This is the correct approach for panel data with few time periods.
+    Each quarterly coefficient tells you: in that quarter, which fundamentals
+    separated winners from losers?
     """
-    scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    df = X.copy()
+    df["ForwardReturn"] = y.values
+    df["Quarter"]       = meta["Quarter"].values
+    df["Ticker"]        = meta["Ticker"].values
 
-    tscv = TimeSeriesSplit(n_splits=5)
+    quarters = sorted(df["Quarter"].unique())
+    quarterly_coefs = []
 
-    cv_r2_scores = []
-    for train_idx, test_idx in tscv.split(X_scaled):
-        X_train, X_test = X_scaled[train_idx], X_scaled[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    print(f"\nRunning cross-sectional regression for {len(quarters)} quarters...")
 
-        model = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0])
-        model.fit(X_train, y_train)
-        score = model.score(X_test, y_test)
-        cv_r2_scores.append(score)
+    for quarter in quarters:
+        q_df = df[df["Quarter"] == quarter].copy()
 
-    mean_cv_r2 = np.mean(cv_r2_scores)
-    print(f"Ridge CV R² scores per fold: {[round(s, 3) for s in cv_r2_scores]}")
-    print(f"Mean out-of-sample R²: {mean_cv_r2:.3f}")
+        if len(q_df) < len(FEATURES) + 2:
+            print(f"  Skipping {quarter} — too few stocks ({len(q_df)})")
+            continue
 
-    # Refit on all data for coefficients
-    final_model = RidgeCV(alphas=[0.01, 0.1, 1.0, 10.0, 100.0])
-    final_model.fit(X_scaled, y)
+        X_q = q_df[FEATURES].dropna()
+        y_q = q_df.loc[X_q.index, "ForwardReturn"]
 
-    coef_df = pd.DataFrame({
-        "Feature":     FEATURES,
-        "Coefficient": final_model.coef_,
-        "MeanCV_R2":   mean_cv_r2,
-    }).sort_values("Coefficient", key=abs, ascending=False)
+        if len(X_q) < len(FEATURES) + 2:
+            continue
 
-    return final_model, scaler, coef_df, cv_r2_scores
+        try:
+            model = sm.OLS(y_q, sm.add_constant(X_q)).fit()
+            coef_row = {"Quarter": quarter, "R2": model.rsquared, "N": len(y_q)}
+            for feat in FEATURES:
+                coef_row[feat] = model.params.get(feat, np.nan)
+            quarterly_coefs.append(coef_row)
+            print(f"  {quarter}: R²={model.rsquared:.3f}, N={len(y_q)}")
+        except Exception as e:
+            print(f"  Skipping {quarter}: {e}")
 
+    if not quarterly_coefs:
+        print("❌ No quarters had enough data for Fama-MacBeth.")
+        return None, None, None
 
-def ridge_cv_summary_for_powerbi(cv_r2_scores):
-    return pd.DataFrame({
-        "Fold":  [f"Fold {i+1}" for i in range(len(cv_r2_scores))],
-        "CV_R2": cv_r2_scores,
-    })
+    coef_df = pd.DataFrame(quarterly_coefs)
 
+    # ── Step 2: Average coefficients and t-test ──
+    summary_rows = []
+    for feat in FEATURES:
+        if feat not in coef_df.columns:
+            continue
+        vals = coef_df[feat].dropna()
+        if len(vals) < 2:
+            continue
 
-# ── Model 3: Logistic ─────────────────────────────────────────────────────────
+        mean_coef = vals.mean()
+        std_coef  = vals.std()
+        n         = len(vals)
+        t_stat    = mean_coef / (std_coef / np.sqrt(n))
+        p_value   = 2 * (1 - sm.stats.stattools.durbin_watson([0]))  # placeholder
+        # Proper p-value using t-distribution
+        from scipy import stats
+        p_value = 2 * stats.t.sf(abs(t_stat), df=n - 1)
 
-def run_logistic(X, y, market_return=0.0):
-    y_binary = (y > market_return).astype(int)
-    scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    model    = LogisticRegression(max_iter=1000, class_weight="balanced")
-    model.fit(X_scaled, y_binary)
+        summary_rows.append({
+            "Feature":     feat,
+            "MeanCoef":    mean_coef,
+            "StdCoef":     std_coef,
+            "T_Stat":      t_stat,
+            "PValue":      p_value,
+            "Significant": p_value < 0.05,
+            "N_Quarters":  n,
+        })
 
-    # Time series CV accuracy
-    tscv = TimeSeriesSplit(n_splits=5)
-    cv_acc = []
-    for train_idx, test_idx in tscv.split(X_scaled):
-        m = LogisticRegression(max_iter=1000, class_weight="balanced")
-        m.fit(X_scaled[train_idx], y_binary.iloc[train_idx])
-        cv_acc.append(m.score(X_scaled[test_idx], y_binary.iloc[test_idx]))
+    summary_df = pd.DataFrame(summary_rows).sort_values("T_Stat", key=abs, ascending=False)
 
-    print(f"Logistic CV accuracy per fold: {[round(a, 3) for a in cv_acc]}")
-    print(f"Mean out-of-sample accuracy:   {np.mean(cv_acc):.3f}")
+    print("\n── Fama-MacBeth Summary ──")
+    print(summary_df[["Feature", "MeanCoef", "T_Stat", "PValue", "Significant"]].to_string(index=False))
 
-    return model, scaler, y_binary, cv_acc
-
-
-def logistic_results_for_powerbi(model, scaler, X, y_binary, meta, feature_names, cv_acc):
-    X_scaled = scaler.transform(X)
-
-    coef_df = pd.DataFrame({
-        "Feature":    feature_names,
-        "Coefficient": model.coef_[0],
-        "OddsRatio":  np.exp(model.coef_[0]),
-        "MeanCV_Acc": np.mean(cv_acc),
-    })
-
-    pred_df = meta.copy()
-    pred_df["ProbOutperform"] = model.predict_proba(X_scaled)[:, 1]
-    pred_df["Predicted"]      = model.predict(X_scaled)
-    pred_df["Actual"]         = y_binary.values
-    pred_df["Correct"]        = (pred_df["Predicted"] == pred_df["Actual"]).astype(int)
-    return coef_df, pred_df
+    return coef_df, summary_df
 
 
-# ── Model 4: Sector OLS ───────────────────────────────────────────────────────
+# ── Model 3: Sector OLS ───────────────────────────────────────────────────────
 
 def run_sector_regressions(X, y, meta):
     results = []
@@ -314,18 +286,28 @@ def run_sector_regressions(X, y, meta):
     return pd.DataFrame(results).sort_values("R2", ascending=False)
 
 
-# ── Export ────────────────────────────────────────────────────────────────────
+# ── Save to MongoDB ───────────────────────────────────────────────────────────
 
-def export_csvs(ols_coef, ols_pred, ridge_coef, ridge_cv,
-                log_coef, log_pred, sector_results):
+def save_to_mongo(db, collection_name, df):
+    col = db[collection_name]
+    col.drop()
+    records = df.copy()
+    # Convert bool columns to plain Python bool for MongoDB
+    for c in records.select_dtypes(include="bool").columns:
+        records[c] = records[c].astype(bool)
+    records = records.to_dict("records")
+    if records:
+        col.insert_many(records)
+    print(f"✅ Saved {len(records)} rows to MongoDB:{collection_name}")
+
+
+def export_csvs(ols_coef, ols_pred, fm_quarterly, fm_summary, sector_results):
     os.makedirs("output", exist_ok=True)
-    ols_coef.to_csv("output/ols_coefficients.csv",      index=False)
-    ols_pred.to_csv("output/ols_predictions.csv",       index=False)
-    ridge_coef.to_csv("output/ridge_coefficients.csv",  index=False)
-    ridge_cv.to_csv("output/ridge_cv_scores.csv",       index=False)
-    log_coef.to_csv("output/logistic_coefficients.csv", index=False)
-    log_pred.to_csv("output/logistic_predictions.csv",  index=False)
-    sector_results.to_csv("output/sector_r2.csv",       index=False)
+    ols_coef.to_csv("output/ols_coefficients.csv",       index=False)
+    ols_pred.to_csv("output/ols_predictions.csv",        index=False)
+    fm_quarterly.to_csv("output/fm_quarterly_coefs.csv", index=False)
+    fm_summary.to_csv("output/fm_summary.csv",           index=False)
+    sector_results.to_csv("output/sector_r2.csv",        index=False)
     print("✅ CSVs exported to output/")
 
 
@@ -336,11 +318,6 @@ def run_regression():
 
     print("Loading data...")
     df = load_data(db)
-    print(f"Columns: {list(df.columns)}")
-    print(f"GrossMargin NaN: {df['GrossMargin'].isna().sum()} / {len(df)}")
-    print(f"Volatility_3M NaN: {df['Volatility_3M'].isna().sum()} / {len(df)}")
-    print(f"Beta NaN: {df['Beta'].isna().sum()} / {len(df)}")
-    print(f"ForwardReturn NaN: {df['ForwardReturn'].isna().sum()} / {len(df)}")
 
     print(f"Dataset size before cleaning: {len(df)}")
     X, y, meta = build_dataset(df)
@@ -350,10 +327,11 @@ def run_regression():
         print("❌ Not enough data. Run UPDATE_MODE 2 and 3 first.")
         return
 
-    # OLS
+    # ── OLS ──
     print("\n── OLS Regression ──")
     ols_model = run_ols(X, y)
-    ols_coef  = ols_results_for_powerbi(ols_model, FEATURES)
+    ols_coef  = ols_results_for_mongo(ols_model, FEATURES)
+
     X_const   = sm.add_constant(X)
     ols_pred  = meta.copy()
     ols_pred["PredictedReturn"] = ols_model.predict(X_const)
@@ -361,37 +339,33 @@ def run_regression():
     ols_pred["Residual"]        = ols_pred["ActualReturn"] - ols_pred["PredictedReturn"]
     ols_pred["QuarterDate"]     = ols_pred["QuarterDate"].astype(str)
 
-    # Ridge CV
-    print("\n── Ridge Regression with Time Series CV ──")
-    ridge_model, ridge_scaler, ridge_coef, cv_r2 = run_ridge_cv(X, y)
-    ridge_cv = ridge_cv_summary_for_powerbi(cv_r2)
+    # ── Fama-MacBeth ──
+    print("\n── Fama-MacBeth Regression ──")
+    fm_quarterly, fm_summary = run_fama_macbeth(X, y, meta)
 
-    # Logistic
-    print("\n── Logistic Regression with Time Series CV ──")
-    log_model, log_scaler, y_binary, cv_acc = run_logistic(X, y)
-    log_coef, log_pred = logistic_results_for_powerbi(
-        log_model, log_scaler, X, y_binary, meta, FEATURES, cv_acc
-    )
-    log_pred["QuarterDate"] = log_pred["QuarterDate"].astype(str)
-
-    # Sector
+    # ── Sector ──
     print("\n── Sector Regressions ──")
     sector_results = run_sector_regressions(X, y, meta)
     print(sector_results)
 
-    # Export
-    export_csvs(ols_coef, ols_pred, ridge_coef, ridge_cv,
-                log_coef, log_pred, sector_results)
+    # ── Save to MongoDB ──
+    save_to_mongo(db, "Regression_OLS_Coefficients",  ols_coef)
+    save_to_mongo(db, "Regression_OLS_Predictions",   ols_pred)
+    save_to_mongo(db, "Regression_FM_QuarterlyCoefs", fm_quarterly)
+    save_to_mongo(db, "Regression_FM_Summary",        fm_summary)
+    save_to_mongo(db, "Regression_Sector_R2",         sector_results)
 
-    print("\n✅ Done. Features used:")
-    for f in FEATURES:
-        print(f"   {f}")
+    # ── Export CSV as backup ──
+    if fm_quarterly is not None and fm_summary is not None:
+        export_csvs(ols_coef, ols_pred, fm_quarterly, fm_summary, sector_results)
 
-    print(f"Columns: {list(df.columns)}")
-    print(f"GrossMargin NaN: {df['GrossMargin'].isna().sum()} / {len(df)}")
-    print(f"Volatility_3M NaN: {df['Volatility_3M'].isna().sum()} / {len(df)}")
-    print(f"Beta NaN: {df['Beta'].isna().sum()} / {len(df)}")
-    print(f"ForwardReturn NaN: {df['ForwardReturn'].isna().sum()} / {len(df)}")
+    print("\n✅ Done.")
+    print("MongoDB collections written:")
+    print("  Regression_OLS_Coefficients")
+    print("  Regression_OLS_Predictions")
+    print("  Regression_FM_QuarterlyCoefs  ← coefficient per quarter")
+    print("  Regression_FM_Summary         ← averaged + t-tested")
+    print("  Regression_Sector_R2")
 
 
 if __name__ == "__main__":
