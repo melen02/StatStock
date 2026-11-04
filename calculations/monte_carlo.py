@@ -1,447 +1,370 @@
-import os
-import pandas as pd
-import numpy as np
-from loadData.db import get_database
+"""Correlated Merton jump-diffusion simulation with a VaR backtest.
 
+Every stock is simulated in one correlated run, so stock and portfolio results are
+consistent with each other. Daily log return of stock i:
+
+    drift_i + diffusion_i + idiosyncratic jumps_i + beta_i * market jumps
+
+drift_i includes the jump compensators, so that E[S_T] = S_0 * exp(mu_i * T).
+"""
+import os
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+from loadData.db import OUTPUT_DIR, get_database
+from loadData.market_data import load_history, wide_prices
+from loadData.mongo_helpers import replace_collection
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-N_SIMULATIONS  = 1000
-N_DAYS         = 252
-CONFIDENCE     = [0.05, 0.25, 0.50, 0.75, 0.95]
-LOOKBACK_DAYS  = 252
+SEED = 42
+N_SIMULATIONS = 5000
+N_DAYS = 252
+LOOKBACK_DAYS = 252
+FAN_STEP_DAYS = 5
+PERCENTILES = [5, 25, 50, 75, 95]
+VAR_LEVEL = 0.05
 
-# Jump diffusion parameters (Merton model)
-JUMP_INTENSITY  = 5      # expected number of jumps per year (lambda)
-JUMP_MEAN       = -0.03  # average jump size (negative = crashes more common)
-JUMP_STD        = 0.08   # std of jump size
+# A year of returns says almost nothing about expected return: with 30% volatility
+# the standard error of the mean is 30 percentage points. Drift is therefore set
+# from CAPM with these assumed values, and is not estimated from recent performance.
+RISK_FREE_RATE = 0.04
+EQUITY_PREMIUM = 0.05
+MAX_ANNUAL_TILT = 0.05  # largest drift change allowed from the regression signal
 
-# Mean reversion (not used in GBM, but used to cap drift)
-MAX_ANNUAL_DRIFT = 1.5   # cap drift at 150% annualised — prevents runaway optimism
+JUMP_THRESHOLD = 3.0     # jump = move beyond this many robust standard deviations
+MIN_OWN_JUMPS = 5        # with fewer, a stock borrows jump sizes from the whole universe
+MIN_JUMP_STD = 0.02
 
-# Fundamentals adjustment
-FM_WEIGHT = 0.3          # how much weight to give fundamentals vs historical drift
-
-
-# ── Load data ─────────────────────────────────────────────────────────────────
-
-def load_history(db):
-    history = pd.DataFrame(list(db["Stock_History"].find()))
-    history.drop(columns=["_id"], errors="ignore", inplace=True)
-    history["Date"] = pd.to_datetime(history["Date"])
-    history = history.sort_values(["Ticker", "Date"])
-    history["DailyReturn"] = history.groupby("Ticker")["Close"].pct_change(fill_method=None)
-    return history
-
-
-def load_fundamentals_signal(db):
-    """
-    Load Fama-MacBeth summary to get which features significantly predict returns.
-    Also load latest quarterly data to score each stock.
-    """
-    try:
-        fm_summary = pd.DataFrame(list(db["Regression_FM_Summary"].find()))
-        fm_summary.drop(columns=["_id"], errors="ignore", inplace=True)
-
-        quarterly = pd.DataFrame(list(db["CompanyQuarterlyData"].find()))
-        quarterly.drop(columns=["_id"], errors="ignore", inplace=True)
-        quarterly["QuarterDate"] = pd.to_datetime(quarterly["QuarterDate"])
-
-        # Get most recent quarter per ticker
-        latest = (
-            quarterly.sort_values("QuarterDate")
-            .groupby("Ticker")
-            .last()
-            .reset_index()
-        )
-
-        return fm_summary, latest
-
-    except Exception as e:
-        print(f"  Could not load fundamentals signal: {e}")
-        return None, None
-
-
-def compute_fundamentals_score(fm_summary, latest_quarterly):
-    """
-    For each stock, compute a fundamentals score based on significant FM predictors.
-    Score is a weighted sum of standardised feature values × FM coefficient.
-    Positive score → fundamentals suggest above-average return.
-    Negative score → fundamentals suggest below-average return.
-    """
-    if fm_summary is None or latest_quarterly is None:
-        return {}
-
-    # Only use features with reasonable t-stat (|T_Stat| > 1.0)
-    significant = fm_summary[fm_summary["T_Stat"].abs() > 1.0].copy()
-
-    if significant.empty:
-        return {}
-
-    features = significant["Feature"].tolist()
-    coefs    = significant.set_index("Feature")["MeanCoef"]
-
-    scores = {}
-    for _, row in latest_quarterly.iterrows():
-        ticker = row["Ticker"]
-        score  = 0.0
-        for feat in features:
-            if feat in row and pd.notna(row[feat]):
-                # Standardise using cross-sectional mean/std
-                col_vals = latest_quarterly[feat].dropna()
-                if col_vals.std() > 0:
-                    z = (row[feat] - col_vals.mean()) / col_vals.std()
-                    score += coefs[feat] * z
-        scores[ticker] = score
-
-    # Normalise scores to [-0.02, 0.02] daily drift adjustment
-    if scores:
-        vals = np.array(list(scores.values()))
-        lo, hi = vals.min(), vals.max()
-        if hi > lo:
-            for t in scores:
-                scores[t] = (scores[t] - lo) / (hi - lo) * 0.04 - 0.02
-        else:
-            scores = {t: 0.0 for t in scores}
-
-    return scores
+BACKTEST_HORIZON = 63
+BACKTEST_SIMULATIONS = 2000
+BACKTEST_MIN_HISTORY = 504
+BOOTSTRAP_RESAMPLES = 5000
 
 
 # ── Parameter estimation ──────────────────────────────────────────────────────
 
-def estimate_parameters(history, fundamentals_scores):
-    params = []
-
-    for ticker, group in history.groupby("Ticker"):
-        recent  = group.tail(LOOKBACK_DAYS).copy()
-        returns = recent["DailyReturn"].dropna()
-
-        if len(returns) < 30:
-            continue
-
-        log_returns = np.log(1 + returns)
-        mu_daily    = log_returns.mean()
-        sigma_daily = log_returns.std()
-
-        # Cap annualised drift to prevent runaway optimism
-        mu_annual_raw = mu_daily * 252
-        mu_annual_cap = np.clip(mu_annual_raw, -MAX_ANNUAL_DRIFT, MAX_ANNUAL_DRIFT)
-
-        if mu_annual_raw != mu_annual_cap:
-            mu_daily = mu_annual_cap / 252
-
-        # Fundamentals adjustment — blend historical drift with fundamentals signal
-        fm_adjustment = fundamentals_scores.get(ticker, 0.0)
-        mu_daily_adj  = (1 - FM_WEIGHT) * mu_daily + FM_WEIGHT * (mu_daily + fm_adjustment)
-
-        sigma_annual = sigma_daily * np.sqrt(252)
-
-        # Estimate jump parameters from historical large moves
-        # Define jumps as daily returns beyond 3 sigma
-        threshold   = 3 * sigma_daily
-        jump_days   = returns[returns.abs() > threshold]
-        jump_freq   = len(jump_days) / len(returns) * 252  # annualised jump frequency
-        jump_mean   = jump_days.mean() if len(jump_days) > 0 else JUMP_MEAN
-        jump_std    = jump_days.std()  if len(jump_days) > 1 else JUMP_STD
-
-        # Use estimated jumps but bound them sensibly
-        jump_freq = np.clip(jump_freq, 1, 20)
-        jump_mean = np.clip(jump_mean, -0.15, 0.05)
-        jump_std  = np.clip(jump_std,  0.02, 0.20)
-
-        last_price = recent["Close"].iloc[-1]
-        last_date  = recent["Date"].iloc[-1]
-
-        params.append({
-            "Ticker":          ticker,
-            "LastPrice":       last_price,
-            "LastDate":        last_date,
-            "MuDaily_Raw":     log_returns.mean(),
-            "MuDaily_Adj":     mu_daily_adj,
-            "FMadjustment":    fm_adjustment,
-            "SigmaDaily":      sigma_daily,
-            "MuAnnual":        mu_daily_adj * 252,
-            "SigmaAnnual":     sigma_annual,
-            "JumpFreq":        jump_freq,
-            "JumpMean":        jump_mean,
-            "JumpStd":         jump_std,
-            "SharpeRatio":     (mu_daily_adj * 252) / sigma_annual if sigma_annual > 0 else np.nan,
-        })
-
-    return pd.DataFrame(params)
+def robust_sigma(x):
+    """Estimate standard deviation per column from the MAD, so jumps don't inflate it."""
+    return 1.4826 * np.median(np.abs(x - np.median(x, axis=0, keepdims=True)), axis=0)
 
 
-# ── Jump diffusion simulation (Merton model) ──────────────────────────────────
+def jump_mask(x):
+    """Flag values far from the median, column by column."""
+    return np.abs(x - np.median(x, axis=0, keepdims=True)) > JUMP_THRESHOLD * robust_sigma(x)
 
-def run_jump_diffusion(S0, mu, sigma, jump_freq, jump_mean, jump_std, n_days, n_sims):
+
+def compensator(mean, std, loading=1.0):
+    """E[exp(loading * J)] - 1 for a normally distributed jump J."""
+    return np.exp(loading * mean + 0.5 * (loading * std) ** 2) - 1
+
+
+def jump_size_stats(sizes):
+    if len(sizes) < 2:
+        return 0.0, MIN_JUMP_STD
+    return float(sizes.mean()), max(float(sizes.std(ddof=1)), MIN_JUMP_STD)
+
+
+def estimate_parameters(log_returns, tilts=None):
+    """Estimate model parameters using only the history passed in.
+
+    log_returns is a complete dates-by-tickers table. Market jumps are rare, so they
+    are estimated from all of it. Everything else uses the last LOOKBACK_DAYS.
     """
-    Merton Jump Diffusion Model:
-        S(t) = S(0) * exp(diffusion + jumps)
+    tickers = log_returns.columns
+    all_returns = log_returns.values
+    market_all = all_returns.mean(axis=1, keepdims=True)
+    market_jumps_all = jump_mask(market_all).ravel()
 
-    Diffusion: standard GBM component
-    Jumps: Poisson-distributed number of jumps per day,
-           each jump drawn from N(jump_mean, jump_std)
+    window = all_returns[-LOOKBACK_DAYS:]
+    market = market_all[-LOOKBACK_DAYS:]
+    market_jump_days = market_jumps_all[-LOOKBACK_DAYS:]
 
-    The drift is adjusted for the expected jump contribution:
-        mu_adj = mu - lambda * (exp(jump_mean + 0.5*jump_std^2) - 1)
-    so that the expected return equals mu regardless of jumps.
-    """
-    dt          = 1
-    lambda_dt   = jump_freq / 252  # daily jump probability
+    market_lambda = market_jumps_all.mean() * 252
+    market_jump_mean, market_jump_std = jump_size_stats(market_all[market_jumps_all].ravel())
 
-    # Drift adjustment for jump component
-    expected_jump = np.exp(jump_mean + 0.5 * jump_std**2) - 1
-    mu_adj        = mu - lambda_dt * expected_jump
+    calm = window[~market_jump_days]
+    market_dev = market[~market_jump_days] - market[~market_jump_days].mean()
+    betas = ((calm - calm.mean(axis=0)).T @ market_dev / (market_dev.T @ market_dev)).ravel()
 
-    # Diffusion component
-    Z = np.random.standard_normal((n_days, n_sims))
-    diffusion = (mu_adj - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * Z
+    own_jumps = jump_mask(calm)
+    pooled_mean, pooled_std = jump_size_stats(calm[own_jumps])
+    jump_lambda = own_jumps.mean(axis=0) * 252
+    jump_mean = np.full(len(tickers), pooled_mean)
+    jump_std = np.full(len(tickers), pooled_std)
+    for i in np.flatnonzero(own_jumps.sum(axis=0) >= MIN_OWN_JUMPS):
+        jump_mean[i], jump_std[i] = jump_size_stats(calm[own_jumps[:, i], i])
 
-    # Jump component — Poisson number of jumps per day
-    N_jumps     = np.random.poisson(lambda_dt, (n_days, n_sims))
-    jump_shocks = np.random.normal(jump_mean, jump_std, (n_days, n_sims))
-    jumps       = N_jumps * jump_shocks
+    # Jump moves are already counted through the jump terms, so they are replaced with
+    # the median here. Replacing single values instead of deleting whole days keeps
+    # the matrix positive semi-definite.
+    diffusion_cov = np.cov(np.where(own_jumps, np.median(calm, axis=0), calm), rowvar=False)
 
-    daily_log_returns = diffusion + jumps
-    price_paths = S0 * np.exp(np.cumsum(daily_log_returns, axis=0))
+    tilt = np.zeros(len(tickers)) if tilts is None else tilts.reindex(tickers).fillna(0.0).values
 
-    return price_paths
-
-
-# ── Simulate all stocks ───────────────────────────────────────────────────────
-
-def simulate_all(params_df):
-    percentile_rows = []
-    terminal_rows   = []
-
-    print(f"Running {N_SIMULATIONS} simulations × {N_DAYS} days for {len(params_df)} stocks...")
-    print("Model: Merton Jump Diffusion + Fundamentals-adjusted drift\n")
-
-    for _, row in params_df.iterrows():
-        ticker    = row["Ticker"]
-        S0        = row["LastPrice"]
-        mu        = row["MuDaily_Adj"]
-        sigma     = row["SigmaDaily"]
-        jump_freq = row["JumpFreq"]
-        jump_mean = row["JumpMean"]
-        jump_std  = row["JumpStd"]
-
-        paths = run_jump_diffusion(
-            S0, mu, sigma, jump_freq, jump_mean, jump_std, N_DAYS, N_SIMULATIONS
-        )
-
-        # Fan chart — every 5 days
-        for day in range(0, N_DAYS, 5):
-            day_prices = paths[day, :]
-            p_row = {"Ticker": ticker, "Day": day + 1}
-            for p in CONFIDENCE:
-                p_row[f"P{int(p*100)}"] = float(np.percentile(day_prices, p * 100))
-            percentile_rows.append(p_row)
-
-        # Terminal distribution
-        terminal_prices = paths[-1, :]
-        terminal_return = terminal_prices / S0 - 1
-
-        terminal_rows.append({
-            "Ticker":           ticker,
-            "LastPrice":        float(S0),
-            "MuAnnual":         float(row["MuAnnual"]),
-            "SigmaAnnual":      float(row["SigmaAnnual"]),
-            "FMadjustment":     float(row["FMadjustment"]),
-            "JumpFreq":         float(jump_freq),
-            "SharpeRatio":      float(row["SharpeRatio"]) if pd.notna(row["SharpeRatio"]) else None,
-            "MedianReturn":     float(np.percentile(terminal_return, 50)),
-            "P5_Return":        float(np.percentile(terminal_return, 5)),
-            "P95_Return":       float(np.percentile(terminal_return, 95)),
-            "P5_Price":         float(np.percentile(terminal_prices, 5)),
-            "P95_Price":        float(np.percentile(terminal_prices, 95)),
-            "ProbPositive":     float((terminal_return > 0).mean()),
-            "ProbUp10pct":      float((terminal_return > 0.10).mean()),
-            "ProbDown20pct":    float((terminal_return < -0.20).mean()),
-            "ExpectedReturn":   float(terminal_return.mean()),
-            "VaR_5pct":         float(np.percentile(terminal_return, 5)),
-            "CVaR_5pct":        float(terminal_return[terminal_return <= np.percentile(terminal_return, 5)].mean()),
-        })
-
-        if len(terminal_rows) % 20 == 0:
-            print(f"  {len(terminal_rows)}/{len(params_df)} done...")
-
-    return pd.DataFrame(percentile_rows), pd.DataFrame(terminal_rows)
-
-
-# ── Portfolio simulation ──────────────────────────────────────────────────────
-
-def simulate_equal_weight_portfolio(params_df, history):
-    print("\nSimulating equal-weight portfolio (correlated jump diffusion)...")
-
-    tickers = params_df["Ticker"].tolist()
-
-    pivot = (
-        history.pivot(index="Date", columns="Ticker", values="DailyReturn")
-        [tickers]
-        .dropna()
-        .tail(LOOKBACK_DAYS)
-    )
-
-    if pivot.empty or len(pivot) < 30:
-        print("  Not enough data for portfolio simulation, skipping.")
-        return None
-
-    log_pivot  = np.log(1 + pivot)
-    cov_matrix = log_pivot.cov().values
-    mu_vector  = params_df.set_index("Ticker").loc[tickers, "MuDaily_Adj"].values
-
-    n_stocks = len(tickers)
-    weights  = np.ones(n_stocks) / n_stocks
-
-    # Average jump parameters across stocks
-    avg_jump_freq = params_df["JumpFreq"].mean()
-    avg_jump_mean = params_df["JumpMean"].mean()
-    avg_jump_std  = params_df["JumpStd"].mean()
-    lambda_dt     = avg_jump_freq / 252
-    expected_jump = np.exp(avg_jump_mean + 0.5 * avg_jump_std**2) - 1
-
-    portfolio_paths = []
-
-    for _ in range(N_SIMULATIONS):
-        try:
-            L = np.linalg.cholesky(cov_matrix + 1e-8 * np.eye(n_stocks))
-        except np.linalg.LinAlgError:
-            L = np.diag(np.sqrt(np.diag(cov_matrix)))
-
-        Z = np.random.standard_normal((N_DAYS, n_stocks))
-        correlated_shocks = Z @ L.T
-
-        sigma_vec = np.sqrt(np.diag(cov_matrix))
-        mu_adj    = mu_vector - lambda_dt * expected_jump
-
-        diffusion = (mu_adj - 0.5 * sigma_vec**2) + correlated_shocks
-
-        # Portfolio-level jumps
-        N_jumps     = np.random.poisson(lambda_dt, (N_DAYS, 1))
-        jump_shocks = np.random.normal(avg_jump_mean, avg_jump_std, (N_DAYS, 1))
-        jumps       = N_jumps * jump_shocks
-
-        daily_log_returns = diffusion + jumps
-        stock_paths = np.exp(np.cumsum(daily_log_returns, axis=0))
-        portfolio_path = stock_paths @ weights
-        portfolio_paths.append(portfolio_path)
-
-    portfolio_paths = np.array(portfolio_paths).T
-
-    portfolio_rows = []
-    for day in range(0, N_DAYS, 5):
-        day_values = portfolio_paths[day, :]
-        p_row = {"Ticker": "PORTFOLIO_EW", "Day": day + 1}
-        for p in CONFIDENCE:
-            p_row[f"P{int(p*100)}"] = float(np.percentile(day_values, p * 100))
-        portfolio_rows.append(p_row)
-
-    terminal        = portfolio_paths[-1, :]
-    terminal_return = terminal - 1
-
-    portfolio_summary = {
-        "Ticker":        "PORTFOLIO_EW",
-        "LastPrice":     1.0,
-        "MuAnnual":      float((mu_vector * 252 * weights).sum()),
-        "SigmaAnnual":   float(np.sqrt(weights @ (cov_matrix * 252) @ weights)),
-        "FMadjustment":  0.0,
-        "JumpFreq":      float(avg_jump_freq),
-        "SharpeRatio":   None,
-        "MedianReturn":  float(np.percentile(terminal_return, 50)),
-        "P5_Return":     float(np.percentile(terminal_return, 5)),
-        "P95_Return":    float(np.percentile(terminal_return, 95)),
-        "P5_Price":      float(np.percentile(terminal, 5)),
-        "P95_Price":     float(np.percentile(terminal, 95)),
-        "ProbPositive":  float((terminal_return > 0).mean()),
-        "ProbUp10pct":   float((terminal_return > 0.10).mean()),
-        "ProbDown20pct": float((terminal_return < -0.20).mean()),
-        "ExpectedReturn":float(terminal_return.mean()),
-        "VaR_5pct":      float(np.percentile(terminal_return, 5)),
-        "CVaR_5pct":     float(terminal_return[terminal_return <= np.percentile(terminal_return, 5)].mean()),
+    return {
+        "tickers": tickers,
+        "mu_annual": RISK_FREE_RATE + betas * EQUITY_PREMIUM + tilt,
+        "beta": betas,
+        "tilt_annual": tilt,
+        "diffusion_cov": diffusion_cov,
+        "total_cov": np.cov(window, rowvar=False),  # includes jump days, used by the GBM baseline
+        "jump_lambda": jump_lambda,
+        "jump_mean": jump_mean,
+        "jump_std": jump_std,
+        "market_lambda": market_lambda,
+        "market_jump_mean": market_jump_mean,
+        "market_jump_std": market_jump_std,
     }
 
-    return pd.DataFrame(portfolio_rows), portfolio_summary
+
+def as_gbm(params):
+    """Same drift and total variance, but no jumps: the baseline the jump model must beat."""
+    return {
+        **params,
+        "diffusion_cov": params["total_cov"],
+        "jump_lambda": np.zeros(len(params["tickers"])),
+        "market_lambda": 0.0,
+    }
 
 
-# ── Save to MongoDB ───────────────────────────────────────────────────────────
+# ── Simulation ────────────────────────────────────────────────────────────────
 
-def save_to_mongo(db, collection_name, df):
-    col = db[collection_name]
-    col.drop()
-    records = df.copy()
-    for c in records.select_dtypes(include="bool").columns:
-        records[c] = records[c].astype(bool)
-    for c in records.select_dtypes(include="datetime64").columns:
-        records[c] = records[c].astype(str)
-    records = records.to_dict("records")
-    if records:
-        col.insert_many(records)
-    print(f"✅ Saved {len(records)} rows to MongoDB:{collection_name}")
+def simulate(params, n_days, n_sims, seed=SEED, sample_every=FAN_STEP_DAYS):
+    """Simulate all stocks jointly.
+
+    Returns (sampled days, price relatives with shape [days, sims, stocks]). Each path
+    starts at 1 and the final day is always included.
+    """
+    rng = np.random.default_rng(seed)
+    beta = params["beta"]
+    n_stocks = len(beta)
+    lam = params["jump_lambda"] / 252
+    jump_mean, jump_std = params["jump_mean"], params["jump_std"]
+    market_lam = params["market_lambda"] / 252
+    market_mean, market_std = params["market_jump_mean"], params["market_jump_std"]
+    cov = params["diffusion_cov"]
+
+    try:
+        chol = np.linalg.cholesky(cov + 1e-10 * np.eye(n_stocks))
+    except np.linalg.LinAlgError:
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        chol = eigenvectors * np.sqrt(np.clip(eigenvalues, 0, None))
+
+    drift = (
+        params["mu_annual"] / 252
+        - 0.5 * np.diag(cov)
+        - lam * compensator(jump_mean, jump_std)
+        - market_lam * compensator(market_mean, market_std, beta)
+    )
+
+    sample_days = sorted(set(range(sample_every, n_days + 1, sample_every)) | {n_days})
+    relatives = np.empty((len(sample_days), n_sims, n_stocks), dtype=np.float32)
+    cumulative = np.zeros((n_sims, n_stocks))
+    position = 0
+
+    for day in range(1, n_days + 1):
+        cumulative += drift + rng.standard_normal((n_sims, n_stocks)) @ chol.T
+
+        # A sum of N normal jumps is normal with mean N*m and variance N*s^2.
+        n_jumps = rng.poisson(lam, (n_sims, n_stocks))
+        cumulative += n_jumps * jump_mean + np.sqrt(n_jumps) * jump_std * rng.standard_normal(n_jumps.shape)
+
+        if market_lam > 0:
+            n_market = rng.poisson(market_lam, (n_sims, 1))
+            market_shock = n_market * market_mean + np.sqrt(n_market) * market_std * rng.standard_normal(n_market.shape)
+            cumulative += market_shock * beta
+
+        if day == sample_days[position]:
+            relatives[position] = np.exp(cumulative)
+            position += 1
+
+    return sample_days, relatives
 
 
-def export_csvs(params_df, percentiles_df, terminal_df):
-    os.makedirs("output", exist_ok=True)
-    params_df.to_csv("output/mc_parameters.csv",    index=False)
-    percentiles_df.to_csv("output/mc_fan_chart.csv", index=False)
-    terminal_df.to_csv("output/mc_terminal.csv",    index=False)
-    print("✅ Monte Carlo CSVs exported to output/")
+def risk_metrics(terminal_return):
+    """Summarize a return distribution. VaR is the return at the quantile, so losses are negative."""
+    var = np.percentile(terminal_return, VAR_LEVEL * 100)
+    return {
+        "ExpectedReturn": float(terminal_return.mean()),
+        "MedianReturn": float(np.percentile(terminal_return, 50)),
+        "P5_Return": float(var),
+        "P95_Return": float(np.percentile(terminal_return, 95)),
+        "ProbPositive": float((terminal_return > 0).mean()),
+        "ProbUp10pct": float((terminal_return > 0.10).mean()),
+        "ProbDown20pct": float((terminal_return < -0.20).mean()),
+        "VaR_5pct": float(var),
+        "CVaR_5pct": float(terminal_return[terminal_return <= var].mean()),
+    }
+
+
+def summarize_simulation(params, last_prices, sample_days, relatives):
+    """Return (fan chart rows, terminal rows) for each stock and the equal-weight portfolio."""
+    fan = []
+    terminal = []
+    columns = [f"P{p}" for p in PERCENTILES]
+
+    def add_fan(ticker, values, scale):
+        bands = np.percentile(values, PERCENTILES, axis=1).T * scale
+        fan.append(pd.DataFrame(bands, columns=columns).assign(Ticker=ticker, Day=sample_days))
+
+    for i, ticker in enumerate(params["tickers"]):
+        price = float(last_prices[ticker])
+        add_fan(ticker, relatives[:, :, i], price)
+        terminal.append({"Ticker": ticker, "LastPrice": price, **risk_metrics(relatives[-1, :, i].astype(float) - 1)})
+
+    # Buy and hold: equal weights at the start, which then drift with prices.
+    portfolio = relatives.mean(axis=2)
+    add_fan("PORTFOLIO_EW", portfolio, 1.0)
+    terminal.append({"Ticker": "PORTFOLIO_EW", "LastPrice": 1.0, **risk_metrics(portfolio[-1].astype(float) - 1)})
+
+    return pd.concat(fan, ignore_index=True)[["Ticker", "Day"] + columns], pd.DataFrame(terminal)
+
+
+# ── Backtest ──────────────────────────────────────────────────────────────────
+
+def kupiec_pvalue(breaches, n, level=VAR_LEVEL):
+    """Kupiec's test of whether the breach rate equals the VaR level."""
+    if n == 0:
+        return np.nan
+    statistic = -2 * (stats.binom.logpmf(breaches, n, level) - stats.binom.logpmf(breaches, n, breaches / n))
+    return float(stats.chi2.sf(max(statistic, 0.0), df=1))
+
+
+def backtest(adj_close, horizon=BACKTEST_HORIZON, n_sims=BACKTEST_SIMULATIONS, min_history=BACKTEST_MIN_HISTORY):
+    """Check how often realized returns fall outside the forecast, without future data.
+
+    At each non-overlapping origin, parameters use prior prices only. Drift has no
+    regression tilt here, so this tests the risk model on its own.
+    """
+    log_returns = np.log(adj_close).diff().iloc[1:]
+    rows = []
+
+    for origin in range(min_history, len(log_returns) - horizon + 1, horizon):
+        past = log_returns.iloc[:origin]
+        future = log_returns.iloc[origin:origin + horizon]
+        # A stock needs a full year of data and a complete forecast window.
+        usable = past.iloc[-LOOKBACK_DAYS:].notna().all() & future.notna().all()
+        tickers = usable[usable].index
+        realized_stocks = np.exp(future[tickers].sum()).values - 1
+        realized_portfolio = realized_stocks.mean()
+        params = estimate_parameters(past[tickers].fillna(0.0))
+
+        for model, model_params in [("Jump diffusion", params), ("GBM baseline", as_gbm(params))]:
+            _, relatives = simulate(model_params, horizon, n_sims, seed=SEED + origin, sample_every=horizon)
+            terminal = relatives[-1].astype(float) - 1
+            lower, upper = np.percentile(terminal, [5, 95], axis=0)
+            portfolio = relatives[-1].mean(axis=1).astype(float) - 1
+            p_lower, p_upper = np.percentile(portfolio, [5, 95])
+            date = future.index[0]
+
+            rows.extend(
+                {"Model": model, "Level": "Single stocks", "Origin": date, "Breach": r < lo, "Inside90": lo <= r <= hi}
+                for r, lo, hi in zip(realized_stocks, lower, upper)
+            )
+            rows.append({
+                "Model": model, "Level": "EW portfolio", "Origin": date,
+                "Breach": realized_portfolio < p_lower, "Inside90": p_lower <= realized_portfolio <= p_upper,
+            })
+
+    detail = pd.DataFrame(rows)
+    summary = (
+        detail.groupby(["Model", "Level"])
+        .agg(N=("Breach", "size"), N_Origins=("Origin", "nunique"), Breaches=("Breach", "sum"), Inside90=("Inside90", "mean"))
+        .reset_index()
+    )
+    summary["BreachRate"] = summary["Breaches"] / summary["N"]
+    summary["ExpectedRate"] = VAR_LEVEL
+
+    intervals = [bootstrap_breach_interval(group) for _, group in detail.groupby(["Model", "Level"])]
+    summary[["BreachRate_Low", "BreachRate_High"]] = intervals
+
+    # Kupiec assumes independent observations. Stocks in the same window move together,
+    # so the test is only valid for the portfolio, which has one observation per window.
+    summary["KupiecP"] = [
+        kupiec_pvalue(b, n) if level == "EW portfolio" else np.nan
+        for b, n, level in zip(summary["Breaches"], summary["N"], summary["Level"])
+    ]
+    return summary
+
+
+def bootstrap_breach_interval(detail, n_resamples=BOOTSTRAP_RESAMPLES, seed=SEED):
+    """Return a 95% interval for the breach rate, resampling whole forecast windows.
+
+    Resampling windows instead of single observations respects the fact that stocks
+    tend to breach together in a market-wide selloff.
+    """
+    by_origin = detail.groupby("Origin")["Breach"].agg(["sum", "size"]).values.astype(float)
+    rng = np.random.default_rng(seed)
+    picks = rng.integers(0, len(by_origin), (n_resamples, len(by_origin)))
+    rates = by_origin[picks, 0].sum(axis=1) / by_origin[picks, 1].sum(axis=1)
+    return np.percentile(rates, [2.5, 97.5])
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def load_tilts(db):
+    """Load the regression signal, if one passed its out-of-sample check."""
+    rows = pd.DataFrame(list(db["Regression_Latest_Signal"].find({}, {"_id": 0})))
+    if rows.empty:
+        print("No validated regression signal, so drift is pure CAPM.")
+        return None
+    print(f"Tilting drift with the '{rows['Spec'].iloc[0]}' signal.")
+    annual = rows.set_index("Ticker")["PredictedExcessQuarterly"] * 4
+    return annual.clip(-MAX_ANNUAL_TILT, MAX_ANNUAL_TILT)
+
+
 def run_monte_carlo():
-    np.random.seed(42)
     db = get_database()
-
-    print("Loading price history...")
     history = load_history(db)
-    print(f"Loaded {len(history)} rows across {history['Ticker'].nunique()} tickers")
+    adj_close = wide_prices(history, "AdjClose")
 
-    print("\nLoading fundamentals signal from Fama-MacBeth results...")
-    fm_summary, latest_quarterly = load_fundamentals_signal(db)
-    fundamentals_scores = compute_fundamentals_score(fm_summary, latest_quarterly)
-    print(f"Fundamentals scores computed for {len(fundamentals_scores)} tickers")
+    latest = adj_close.iloc[-LOOKBACK_DAYS - 1:]
+    tickers = latest.columns[latest.notna().all()]
+    log_returns = np.log(adj_close[tickers]).diff().iloc[1:].fillna(0.0)
+    last_prices = wide_prices(history, "Close")[tickers].iloc[-1]
 
-    print("\nEstimating parameters per stock...")
-    params_df = estimate_parameters(history, fundamentals_scores)
-    print(f"Parameters estimated for {len(params_df)} stocks")
+    params = estimate_parameters(log_returns, load_tilts(db))
+    print(f"Simulating {N_SIMULATIONS} paths x {N_DAYS} days x {len(tickers)} stocks...")
+    sample_days, relatives = simulate(params, N_DAYS, N_SIMULATIONS)
+    fan, terminal = summarize_simulation(params, last_prices, sample_days, relatives)
 
-    print(f"\nTop 5 by Sharpe Ratio (FM-adjusted drift):")
-    print(params_df.nlargest(5, "SharpeRatio")[
-        ["Ticker", "MuAnnual", "SigmaAnnual", "FMadjustment", "JumpFreq", "SharpeRatio"]
-    ].to_string(index=False))
+    jump_variance = params["jump_lambda"] * (params["jump_mean"] ** 2 + params["jump_std"] ** 2)
+    market_variance = (
+        params["market_lambda"] * params["beta"] ** 2
+        * (params["market_jump_mean"] ** 2 + params["market_jump_std"] ** 2)
+    )
+    sigma_annual = np.sqrt(np.diag(params["diffusion_cov"]) * 252 + jump_variance + market_variance)
+    parameters = pd.DataFrame({
+        "Ticker": tickers,
+        "LastPrice": last_prices.values,
+        "LastDate": adj_close.index[-1],
+        "Beta": params["beta"],
+        "MuAnnual": params["mu_annual"],
+        "SignalTiltAnnual": params["tilt_annual"],
+        "SigmaAnnual": sigma_annual,
+        "JumpFreq": params["jump_lambda"],
+        "JumpMean": params["jump_mean"],
+        "JumpStd": params["jump_std"],
+        "MarketJumpFreq": params["market_lambda"],
+        "SharpeRatio": (params["mu_annual"] - RISK_FREE_RATE) / sigma_annual,
+    })
 
-    print(f"\nTop 5 most jump-prone stocks:")
-    print(params_df.nlargest(5, "JumpFreq")[
-        ["Ticker", "JumpFreq", "JumpMean", "JumpStd"]
-    ].to_string(index=False))
+    print("\nBacktesting VaR on past data...")
+    backtest_summary = backtest(adj_close)
+    print(backtest_summary.to_string(index=False))
 
-    print("\nRunning individual stock simulations...")
-    percentiles_df, terminal_df = simulate_all(params_df)
+    print("\nOne-year equal-weight portfolio:")
+    print(terminal[terminal["Ticker"] == "PORTFOLIO_EW"].T.to_string(header=False))
 
-    portfolio_result = simulate_equal_weight_portfolio(params_df, history)
-    if portfolio_result is not None:
-        portfolio_fan, portfolio_summary = portfolio_result
-        percentiles_df = pd.concat([percentiles_df, portfolio_fan], ignore_index=True)
-        terminal_df    = pd.concat([terminal_df, pd.DataFrame([portfolio_summary])], ignore_index=True)
-
-    params_df["LastDate"] = params_df["LastDate"].astype(str)
-
-    save_to_mongo(db, "MC_Parameters", params_df)
-    save_to_mongo(db, "MC_FanChart",   percentiles_df)
-    save_to_mongo(db, "MC_Terminal",   terminal_df)
-    export_csvs(params_df, percentiles_df, terminal_df)
-
-    print("\n✅ Done.")
-    print("MongoDB collections written:")
-    print("  MC_Parameters  ← mu, sigma, jump params, FM adjustment per stock")
-    print("  MC_FanChart    ← percentile bands per day (fan chart)")
-    print("  MC_Terminal    ← 1-year outcome distribution + VaR + CVaR")
-
-    print(f"\nSample terminal results:")
-    print(terminal_df[["Ticker", "MedianReturn", "P5_Return", "P95_Return",
-                        "ProbPositive", "VaR_5pct", "CVaR_5pct"]].head(10).to_string(index=False))
+    tables = {"Parameters": parameters, "FanChart": fan, "Terminal": terminal, "Backtest": backtest_summary}
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    for name, table in tables.items():
+        replace_collection(db, f"MC_{name}", table)
+        table.to_csv(os.path.join(OUTPUT_DIR, f"mc_{name.lower()}.csv"), index=False)
+    print(f"Monte Carlo results exported to {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":

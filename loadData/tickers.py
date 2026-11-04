@@ -1,17 +1,20 @@
+# Companies listed today, which makes every historical result survivorship-biased:
+# firms that went bankrupt or were taken private (such as WBA in 2025) are absent.
 TICKERS = [
     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "AMD", "ADBE", "TSM", "SOFI", "ESTC",
     "JNJ", "PFE", "MRK", "ABT", "JPM", "BAC", "WFC", "C", "TSLA", "HD", "NKE", "MCD",
     "DIS", "CMCSA", "NFLX", "VZ", "SPOT", "GE", "CAT", "LMT", "KO", "PG", "PEP", "CL",
     "XOM", "CVX", "COP", "OXY", "DUK", "NEE", "SO", "D", "SPG", "PLD", "PSA", "EQR",
     "DOW", "DD", "NEM", "FCX", "CSCO", "ORCL", "IBM", "INTC", "MU", "AVGO", "TXN",
-    "AMAT", "ADSK", "NOW", "CRM", "SHOP", "SQ", "PYPL", "MA", "V", "AXP", "GS",
+    "AMAT", "ADSK", "NOW", "CRM", "SHOP", "XYZ", "PYPL", "MA", "V", "AXP", "GS",
     "MS", "BK", "USB", "TFC", "CME", "ICE", "CB", "AIG", "UNH", "ABBV", "LLY",
     "BMY", "GILD", "AMGN", "TMO", "WMT", "COST", "LOW", "TJX", "M", "SBUX",
     "GM", "F", "DAL", "BA", "DE", "HON", "RTX", "TXT", "GD", "KMB", "MO",
-    "PM", "BP", "PSX", "EOG", "SLB", "MPC", "CVS", "WBA", "AEP", 
+    "PM", "BP", "PSX", "EOG", "SLB", "MPC", "CVS", "AEP",
 ]
 
-NEW_TICKERS = [  
+# Not loaded yet. Add these to TICKERS to widen the universe.
+NEW_TICKERS = [
     "META", "QCOM", "INTU", "PANW", "CRWD", "SNOW", "MDB", "ZS", "OKTA", "NET",
     "DDOG", "TEAM", "DOCU", "ROKU", "U", "RBLX", "PLTR", "AI", "PATH", "FSLY",
     "ANET", "FTNT", "CDNS", "SNPS", "KLAC", "LRCX", "MCHP", "NXPI", "ON", "MPWR",

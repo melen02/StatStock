@@ -1,371 +1,463 @@
-import os
-import pandas as pd
-import numpy as np
-import statsmodels.api as sm
-from loadData.db import get_database
+"""Cross-sectional return regressions on point-in-time data.
 
+Every feature in a panel row was knowable on that row's formation date:
+
+* Formation dates are shared by all stocks (last trading day of Feb, May, Aug and
+  Nov), so each cross-section compares returns over the same window.
+* A quarter's fundamentals only count once REPORT_LAG_DAYS have passed.
+* Ratios are computed from the price on the formation date, not today's values.
+* Features are scaled within each date, so nothing leaks in from other periods.
+"""
+import os
+
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+from loadData.db import OUTPUT_DIR, get_database
+from loadData.market_data import load_history, wide_prices
+from loadData.mongo_helpers import replace_collection
+from loadData.tickers import TICKERS
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-FEATURES = [
+FUNDAMENTAL_FEATURES = [
     "GrossMargin",
     "OperatingMargin",
     "DebtToAssets",
     "RevenueGrowth",
-    "EPS_Surprise",
+    "EarningsChange",
+    "FCFYield",
+    "EarningsYield",
+    "SalesToPrice",
+]
+PRICE_FEATURES = [
     "Beta",
-    "MarketCap",
-    "FreeCashFlow",
+    "LogMarketCap",
     "Momentum_3M",
     "Momentum_6M",
     "Volatility_3M",
-    "PE_Trailing",
-    "PB",
 ]
 
-RETURN_HORIZON = 63
-MOMENTUM_3M    = 63
-MOMENTUM_6M    = 126
-VOLATILITY_WIN = 63
+# Yahoo only serves about six quarters of fundamentals, while prices go back to 2020.
+# The price-only model therefore has far more cross-sections to test on.
+SPECS = {
+    "full": PRICE_FEATURES + FUNDAMENTAL_FEATURES,
+    "price_only": PRICE_FEATURES,
+}
+
+FORMATION_MONTHS = (2, 5, 8, 11)
+REPORT_LAG_DAYS = 45       # time allowed for a quarter's results to become public
+MAX_FUNDAMENTAL_AGE = 200  # days before a report is too old to use
+MAX_QUARTER_GAP = 100      # growth is only computed between adjacent quarters
+TRADING_DAYS_3M = 63
+TRADING_DAYS_6M = 126
+BETA_WINDOW = 252
+
+WINSOR_LIMITS = (0.01, 0.99)
+MIN_FEATURE_COVERAGE = 0.5   # skip a date where a feature exists for fewer stocks
+MIN_TRAIN_WINDOWS = 3        # cross-sections required before a walk-forward prediction
+MIN_SIGNAL_WINDOWS = 8       # walk-forward windows required to trust a signal
+SIGNAL_MIN_IC_T = 2.0        # IC t-statistic required to trust a signal
+MIN_OBS_PER_FEATURE = 5      # sector regressions with fewer are not worth reporting
 
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+# ── Features ──────────────────────────────────────────────────────────────────
 
-def load_data(db):
-    quarterly    = pd.DataFrame(list(db["CompanyQuarterlyData"].find()))
-    fundamentals = pd.DataFrame(list(db["Fundamentals"].find()))
-    history      = pd.DataFrame(list(db["Stock_History"].find()))
+def formation_dates(index):
+    """Return the last trading day of each formation month, skipping an unfinished month."""
+    dates = pd.Series(index, index=index)
+    periods = index.to_period("M")
+    month_ends = dates.groupby(periods).max()
+    month_ends = month_ends[month_ends.index < periods.max()]
+    return pd.DatetimeIndex(month_ends[month_ends.index.month.isin(FORMATION_MONTHS)].values)
 
-    for df in [quarterly, fundamentals, history]:
-        df.drop(columns=["_id"], errors="ignore", inplace=True)
 
-    # ── Fundamental features ──
-    quarterly = quarterly.sort_values(["Ticker", "QuarterDate"])
+def compute_price_features(adj_close, close, market_cap):
+    """Return a dict of dates-by-tickers tables, each using only data up to that date."""
+    returns = adj_close.pct_change(fill_method=None)
+    market = returns.mean(axis=1)
 
-    quarterly["RevenueGrowth"] = (
-        quarterly.groupby("Ticker")["Revenue"]
-        .pct_change(fill_method=None)
+    # Today's share count scaled by historical price. Ignores buybacks and issuance,
+    # because Yahoo's share history is too patchy to use across the whole universe.
+    shares = market_cap.reindex(close.columns) / close.ffill().iloc[-1]
+
+    min_periods = BETA_WINDOW // 2
+    market_var = market.rolling(BETA_WINDOW, min_periods=min_periods).var()
+    beta = returns.rolling(BETA_WINDOW, min_periods=min_periods).cov(market).div(market_var, axis=0)
+
+    return {
+        "Momentum_3M": adj_close / adj_close.shift(TRADING_DAYS_3M) - 1,
+        "Momentum_6M": adj_close / adj_close.shift(TRADING_DAYS_6M) - 1,
+        "Volatility_3M": returns.rolling(TRADING_DAYS_3M, min_periods=TRADING_DAYS_3M - 10).std(),
+        "Beta": beta,
+        "MarketCapValue": close * shares,
+    }
+
+
+def compute_fundamental_features(quarterly):
+    """Add per-quarter features and the date on which each report counts as public."""
+    q = quarterly.copy()
+    quarter_ends = pd.Series(pd.PeriodIndex(q["Quarter"], freq="Q").end_time.normalize(), index=q.index)
+    q["QuarterDate"] = pd.to_datetime(q["QuarterDate"]).fillna(quarter_ends)
+    q = q.dropna(subset=["Revenue"]).sort_values(["Ticker", "QuarterDate"]).reset_index(drop=True)
+
+    by_ticker = q.groupby("Ticker")
+    adjacent = by_ticker["QuarterDate"].diff().dt.days <= MAX_QUARTER_GAP
+    previous_revenue = by_ticker["Revenue"].shift(1)
+    previous_assets = by_ticker["TotalAssets"].shift(1)
+
+    # Quarter-over-quarter, so seasonal businesses add noise. Year-over-year would
+    # cost four of the few quarters we have.
+    q["RevenueGrowth"] = (q["Revenue"] / previous_revenue - 1).where(adjacent & (previous_revenue > 0))
+
+    # Scaled by assets because a percentage change is meaningless around zero or
+    # negative earnings. This is earnings change, not a surprise against analyst
+    # expectations: Yahoo's estimate history stops too early to use here.
+    q["EarningsChange"] = (by_ticker["NetIncome"].diff() / previous_assets).where(adjacent & (previous_assets > 0))
+
+    q["DebtToAssets"] = (q["TotalDebt"] / q["TotalAssets"]).replace([np.inf, -np.inf], np.nan)
+
+    # Annualised from up to four quarters, to divide by market value on the formation date.
+    for column, target in [("NetIncome", "AnnualEarnings"), ("Revenue", "AnnualSales"), ("FreeCashFlow", "AnnualFCF")]:
+        q[target] = by_ticker[column].transform(lambda s: s.rolling(4, min_periods=2).mean() * 4)
+
+    q["AvailableDate"] = q["QuarterDate"] + pd.Timedelta(days=REPORT_LAG_DAYS)
+    return q
+
+
+def build_panel(quarterly, fundamentals, history):
+    """Build one row per stock and formation date, with features and forward return.
+
+    The newest date has a missing ForwardReturn. It is kept so that a current signal
+    can be computed, and estimation functions drop it.
+    """
+    adj_close = wide_prices(history, "AdjClose")
+    close = wide_prices(history, "Close")
+    market_cap = fundamentals.set_index("Ticker")["MarketCap"].astype(float)
+    price_features = compute_price_features(adj_close, close, market_cap)
+
+    dates = formation_dates(adj_close.index)
+    # Forward returns run to the next formation date, so windows never overlap.
+    prices_at_formation = adj_close.loc[dates]
+    forward_return = prices_at_formation.shift(-1) / prices_at_formation - 1
+
+    tables = {name: table.loc[dates] for name, table in price_features.items()}
+    tables["ForwardReturn"] = forward_return
+    panel = pd.concat(
+        {name: table.stack(future_stack=True) for name, table in tables.items()}, axis=1
+    ).rename_axis(["Date", "Ticker"]).reset_index()
+    panel = panel.dropna(subset=["MarketCapValue"])
+
+    q = compute_fundamental_features(quarterly)
+    panel = pd.merge_asof(
+        panel.sort_values("Date"),
+        q.sort_values("AvailableDate"),
+        left_on="Date",
+        right_on="AvailableDate",
+        by="Ticker",
+        direction="backward",
+        tolerance=pd.Timedelta(days=MAX_FUNDAMENTAL_AGE),
     )
-    quarterly["EPS_Surprise"] = (
-        quarterly.groupby("Ticker")["EPS_Trailing"]
-        .pct_change(fill_method=None)
+
+    value = panel["MarketCapValue"].where(panel["MarketCapValue"] > 0)
+    panel["LogMarketCap"] = np.log(value)
+    panel["EarningsYield"] = panel["AnnualEarnings"] / value
+    panel["SalesToPrice"] = panel["AnnualSales"] / value
+    panel["FCFYield"] = panel["AnnualFCF"] / value
+
+    sectors = fundamentals.set_index("Ticker")["Sector"]
+    panel["Sector"] = panel["Ticker"].map(sectors)
+    return panel.sort_values(["Date", "Ticker"]).reset_index(drop=True)
+
+
+def standardize(panel, features):
+    """Winsorize and z-score each feature within its date, then set missing values to 0.
+
+    A coefficient then reads as return per one cross-sectional standard deviation,
+    so features become comparable. Zero means "average", which is how banks are kept
+    in despite having no gross margin. Dates where a feature is mostly missing are
+    dropped, since that feature would carry no information there.
+    """
+    coverage = panel.groupby("Date")[features].apply(lambda g: g.notna().mean().min())
+    usable = coverage[coverage >= MIN_FEATURE_COVERAGE].index
+    out = panel[panel["Date"].isin(usable)].copy()
+
+    def zscore(s):
+        clipped = s.clip(s.quantile(WINSOR_LIMITS[0]), s.quantile(WINSOR_LIMITS[1]))
+        std = clipped.std()
+        return (clipped - clipped.mean()) / std if std > 0 else clipped * 0.0
+
+    for feature in features:
+        out[feature] = out[feature].replace([np.inf, -np.inf], np.nan)
+        out[feature] = out.groupby("Date")[feature].transform(zscore).fillna(0.0)
+    return out
+
+
+def estimation_rows(panel):
+    return panel.dropna(subset=["ForwardReturn"])
+
+
+# ── Model 1: pooled OLS ───────────────────────────────────────────────────────
+
+def run_pooled_ols(panel, features):
+    """Regress returns in excess of the date's average, clustering errors by date.
+
+    Removing the date average takes out market-wide moves, and clustering allows
+    stocks to stay correlated within a date. Using t(G-1) keeps the inference honest
+    when there are few dates.
+    """
+    data = estimation_rows(panel)
+    excess = data["ForwardReturn"] - data.groupby("Date")["ForwardReturn"].transform("mean")
+    X = data[features]
+    model = sm.OLS(excess, X).fit(
+        cov_type="cluster",
+        cov_kwds={"groups": data["Date"].factorize()[0]},
+        use_t=True,
     )
-    quarterly["DebtToAssets"] = (
-        quarterly["TotalDebt"] / quarterly["TotalAssets"]
-    ).replace([np.inf, -np.inf], np.nan)
+    conf = model.conf_int()
+    X_const = sm.add_constant(X).values
 
-    # ── Price-based features ──
-    history["Date"] = pd.to_datetime(history["Date"])
-    history = history.sort_values(["Ticker", "Date"])
-    history["DailyReturn"] = history.groupby("Ticker")["Close"].pct_change(fill_method=None)
-
-    history["ForwardReturn"] = (
-        history.groupby("Ticker")["Close"]
-        .transform(lambda x: x.shift(-RETURN_HORIZON) / x - 1)
-    )
-    history["Momentum_3M"] = (
-        history.groupby("Ticker")["Close"]
-        .transform(lambda x: x / x.shift(MOMENTUM_3M) - 1)
-    )
-    history["Momentum_6M"] = (
-        history.groupby("Ticker")["Close"]
-        .transform(lambda x: x / x.shift(MOMENTUM_6M) - 1)
-    )
-    history["Volatility_3M"] = (
-        history.groupby("Ticker")["DailyReturn"]
-        .transform(lambda x: x.rolling(VOLATILITY_WIN).std())
-    )
-    history = history.rename(columns={"P_E_Trailing": "PE_Trailing", "P_B": "PB"})
-
-    # ── Snapshot price features at each quarter end ──
-    quarterly["QuarterDate"] = pd.to_datetime(quarterly["QuarterDate"])
-    price_cols = ["ForwardReturn", "Momentum_3M", "Momentum_6M",
-                  "Volatility_3M", "PE_Trailing", "PB"]
-
-    def get_price_snapshot(row):
-        ticker_hist = history[history["Ticker"] == row["Ticker"]]
-        if ticker_hist.empty:
-            return pd.Series({c: None for c in price_cols})
-        quarter_date = pd.to_datetime(row["QuarterDate"]).tz_localize(None)
-        diff = (ticker_hist["Date"] - quarter_date).abs()
-        if diff.dropna().empty:
-            return pd.Series({c: None for c in price_cols})
-        idx = diff.idxmin()
-        return ticker_hist.loc[idx, price_cols]
-
-    print("Snapshotting price features per quarter...")
-    price_snapshot = quarterly.apply(get_price_snapshot, axis=1)
-    quarterly = pd.concat([quarterly, price_snapshot], axis=1)
-
-    df = quarterly.merge(
-        fundamentals[["Ticker", "Beta", "MarketCap", "Sector"]],
-        on="Ticker",
-        how="left"
-    )
-
-    return df
-
-
-# ── Dataset builder ───────────────────────────────────────────────────────────
-
-def build_dataset(df):
-    df = df.reset_index(drop=True)
-
-    available = [c for c in FEATURES + ["ForwardReturn", "Ticker", "Quarter", "Sector", "QuarterDate"]
-                 if c in df.columns]
-    df = df[available].copy()
-
-    required = ["GrossMargin", "OperatingMargin", "Beta", "Volatility_3M", "ForwardReturn"]
-    required = [c for c in required if c in df.columns]
-    df = df.dropna(subset=required)
-
-    # Fill non-required features with global median
-    for col in FEATURES:
-        if col in df.columns:
-            df[col] = df[col].fillna(df[col].median())
-
-    df = df.dropna(subset=[c for c in FEATURES if c in df.columns] + ["ForwardReturn"])
-
-    # Clip outliers
-    for col in [c for c in FEATURES if c in df.columns] + ["ForwardReturn"]:
-        lo, hi = df[col].quantile(0.01), df[col].quantile(0.99)
-        df[col] = df[col].clip(lo, hi)
-
-    df = df.sort_values("QuarterDate").reset_index(drop=True)
-
-    X    = df[FEATURES].reset_index(drop=True)
-    y    = df["ForwardReturn"].reset_index(drop=True)
-    meta = df[["Ticker", "Quarter", "Sector", "QuarterDate"]].reset_index(drop=True)
-
-    return X, y, meta
-
-
-# ── Model 1: OLS ──────────────────────────────────────────────────────────────
-
-def run_ols(X, y):
-    X_const = sm.add_constant(X)
-    model   = sm.OLS(y, X_const).fit()
-    print(model.summary())
-    return model
-
-
-def ols_results_for_mongo(model, feature_names):
-    params  = model.params[1:]
-    pvalues = model.pvalues[1:]
-    conf    = model.conf_int().iloc[1:]
-
-    results = pd.DataFrame({
-        "Feature":     feature_names,
-        "Coefficient": params.values,
-        "PValue":      pvalues.values,
-        "CI_Lower":    conf[0].values,
-        "CI_Upper":    conf[1].values,
-        "Significant": (pvalues < 0.05).values,
-        "R2":          model.rsquared,
-        "AdjR2":       model.rsquared_adj,
+    coefficients = pd.DataFrame({
+        "Feature": features,
+        "Coefficient": model.params.values,
+        "PValue": model.pvalues.values,
+        "CI_Lower": conf[0].values,
+        "CI_Upper": conf[1].values,
+        "Significant": model.pvalues.values < 0.05,
+        "VIF": [variance_inflation_factor(X_const, i + 1) for i in range(len(features))],
+        "R2": model.rsquared,
+        "AdjR2": model.rsquared_adj,
+        "N": int(model.nobs),
+        "N_Dates": data["Date"].nunique(),
     })
-    return results
+
+    predictions = data[["Ticker", "Date", "Sector"]].copy()
+    predictions["PredictedExcess"] = model.fittedvalues
+    predictions["ActualExcess"] = excess
+    predictions["Residual"] = model.resid
+    return coefficients, predictions
 
 
 # ── Model 2: Fama-MacBeth ─────────────────────────────────────────────────────
 
-def run_fama_macbeth(X, y, meta):
+def cross_section_coefficients(panel, features):
+    """Fit one cross-sectional OLS per date. Dates with too few stocks are skipped."""
+    rows = []
+    for date, group in estimation_rows(panel).groupby("Date"):
+        if len(group) < 2 * len(features):
+            print(f"  Skipping {date.date()}: only {len(group)} stocks")
+            continue
+        model = sm.OLS(group["ForwardReturn"], sm.add_constant(group[features])).fit()
+        rows.append({"Date": date, "R2": model.rsquared, "N": len(group), **model.params[features].to_dict()})
+    return pd.DataFrame(rows, columns=["Date", "R2", "N"] + features)
+
+
+def run_fama_macbeth(panel, features):
+    """Average the per-date coefficients and t-test them over time.
+
+    Returns (per-date coefficients, summary). The summary is empty if fewer than two
+    dates have enough stocks. Windows don't overlap, so no autocorrelation correction
+    is applied.
     """
-    Fama-MacBeth regression:
-    1. For each quarter, run a cross-sectional OLS across all stocks
-    2. Collect the coefficients from each quarter
-    3. Average them and t-test whether they're significantly different from zero
+    coefs = cross_section_coefficients(panel, features)
+    if len(coefs) < 2:
+        columns = ["Feature", "MeanCoef", "StdCoef", "T_Stat", "PValue", "QValue", "CI_Lower", "CI_Upper", "N_Dates", "Significant"]
+        return coefs, pd.DataFrame(columns=columns)
 
-    This is the correct approach for panel data with few time periods.
-    Each quarterly coefficient tells you: in that quarter, which fundamentals
-    separated winners from losers?
+    n = len(coefs)
+    mean, std = coefs[features].mean(), coefs[features].std()
+    standard_error = std / np.sqrt(n)
+    t_stat = mean / standard_error
+    p_value = 2 * stats.t.sf(t_stat.abs(), df=n - 1)
+    margin = stats.t.ppf(0.975, n - 1) * standard_error
+
+    summary = pd.DataFrame({
+        "Feature": features,
+        "MeanCoef": mean.values,
+        "StdCoef": std.values,
+        "T_Stat": t_stat.values,
+        "PValue": p_value,
+        # Benjamini-Hochberg: with many features, some look significant by chance.
+        "QValue": multipletests(p_value, method="fdr_bh")[1],
+        "CI_Lower": (mean - margin).values,
+        "CI_Upper": (mean + margin).values,
+        "N_Dates": n,
+    })
+    summary["Significant"] = summary["QValue"] < 0.05
+    return coefs, summary.sort_values("T_Stat", key=np.abs, ascending=False).reset_index(drop=True)
+
+
+# ── Out-of-sample evaluation ──────────────────────────────────────────────────
+
+def walk_forward(panel, features, min_train=MIN_TRAIN_WINDOWS):
+    """Predict each cross-section with coefficients from earlier windows only.
+
+    A window's return is only known at the next formation date, and the coefficients
+    used at a date come from windows that had ended by then.
     """
-    df = X.copy()
-    df["ForwardReturn"] = y.values
-    df["Quarter"]       = meta["Quarter"].values
-    df["Ticker"]        = meta["Ticker"].values
+    coefs = cross_section_coefficients(panel, features).sort_values("Date").reset_index(drop=True)
+    data = estimation_rows(panel)
+    rows = []
 
-    quarters = sorted(df["Quarter"].unique())
-    quarterly_coefs = []
+    for i in range(min_train, len(coefs)):
+        date = coefs.loc[i, "Date"]
+        beta = coefs.loc[: i - 1, features].mean()
+        group = data[data["Date"] == date]
+        actual = group["ForwardReturn"] - group["ForwardReturn"].mean()
+        predicted = group[features].mul(beta).sum(axis=1)
 
-    print(f"\nRunning cross-sectional regression for {len(quarters)} quarters...")
-
-    for quarter in quarters:
-        q_df = df[df["Quarter"] == quarter].copy()
-
-        if len(q_df) < len(FEATURES) + 2:
-            print(f"  Skipping {quarter} — too few stocks ({len(q_df)})")
-            continue
-
-        X_q = q_df[FEATURES].dropna()
-        y_q = q_df.loc[X_q.index, "ForwardReturn"]
-
-        if len(X_q) < len(FEATURES) + 2:
-            continue
-
-        try:
-            model = sm.OLS(y_q, sm.add_constant(X_q)).fit()
-            coef_row = {"Quarter": quarter, "R2": model.rsquared, "N": len(y_q)}
-            for feat in FEATURES:
-                coef_row[feat] = model.params.get(feat, np.nan)
-            quarterly_coefs.append(coef_row)
-            print(f"  {quarter}: R²={model.rsquared:.3f}, N={len(y_q)}")
-        except Exception as e:
-            print(f"  Skipping {quarter}: {e}")
-
-    if not quarterly_coefs:
-        print("❌ No quarters had enough data for Fama-MacBeth.")
-        return None, None, None
-
-    coef_df = pd.DataFrame(quarterly_coefs)
-
-    # ── Step 2: Average coefficients and t-test ──
-    summary_rows = []
-    for feat in FEATURES:
-        if feat not in coef_df.columns:
-            continue
-        vals = coef_df[feat].dropna()
-        if len(vals) < 2:
-            continue
-
-        mean_coef = vals.mean()
-        std_coef  = vals.std()
-        n         = len(vals)
-        t_stat    = mean_coef / (std_coef / np.sqrt(n))
-        p_value   = 2 * (1 - sm.stats.stattools.durbin_watson([0]))  # placeholder
-        # Proper p-value using t-distribution
-        from scipy import stats
-        p_value = 2 * stats.t.sf(abs(t_stat), df=n - 1)
-
-        summary_rows.append({
-            "Feature":     feat,
-            "MeanCoef":    mean_coef,
-            "StdCoef":     std_coef,
-            "T_Stat":      t_stat,
-            "PValue":      p_value,
-            "Significant": p_value < 0.05,
-            "N_Quarters":  n,
+        top = actual[predicted >= predicted.quantile(0.8)].mean()
+        bottom = actual[predicted <= predicted.quantile(0.2)].mean()
+        rows.append({
+            "Date": date,
+            "N": len(group),
+            "RankIC": stats.spearmanr(predicted, actual)[0],
+            "QuintileSpread": top - bottom,
+            "SSE_Model": ((actual - predicted) ** 2).sum(),
+            "SSE_Zero": (actual ** 2).sum(),
         })
 
-    summary_df = pd.DataFrame(summary_rows).sort_values("T_Stat", key=abs, ascending=False)
-
-    print("\n── Fama-MacBeth Summary ──")
-    print(summary_df[["Feature", "MeanCoef", "T_Stat", "PValue", "Significant"]].to_string(index=False))
-
-    return coef_df, summary_df
+    return pd.DataFrame(rows, columns=["Date", "N", "RankIC", "QuintileSpread", "SSE_Model", "SSE_Zero"])
 
 
-# ── Model 3: Sector OLS ───────────────────────────────────────────────────────
+def summarize_walk_forward(windows, in_sample_r2):
+    """Summarize a walk-forward run. OOS R² compares against predicting no excess return."""
+    n = len(windows)
+    if n < 2:
+        return {"N_Windows": n}
 
-def run_sector_regressions(X, y, meta):
+    def t_stat(s):
+        return s.mean() / (s.std() / np.sqrt(n)) if s.std() > 0 else np.nan
+
+    return {
+        "N_Windows": n,
+        "InSample_R2": in_sample_r2,
+        "OOS_R2": 1 - windows["SSE_Model"].sum() / windows["SSE_Zero"].sum(),
+        "MeanRankIC": windows["RankIC"].mean(),
+        "RankIC_T": t_stat(windows["RankIC"]),
+        "IC_HitRate": (windows["RankIC"] > 0).mean(),
+        "MeanQuintileSpread": windows["QuintileSpread"].mean(),
+        "Spread_T": t_stat(windows["QuintileSpread"]),
+    }
+
+
+def signal_is_trustworthy(oos_summary):
+    return (
+        oos_summary.get("N_Windows", 0) >= MIN_SIGNAL_WINDOWS
+        and oos_summary.get("RankIC_T", 0) >= SIGNAL_MIN_IC_T
+    )
+
+
+def latest_signal(panel, features, fm_summary):
+    """Predict next-window excess return for the newest date, on the training scale."""
+    latest = panel[panel["Date"] == panel["Date"].max()]
+    coefficients = fm_summary.set_index("Feature")["MeanCoef"].reindex(features)
+    return pd.DataFrame({
+        "Ticker": latest["Ticker"],
+        "Date": latest["Date"],
+        "PredictedExcessQuarterly": latest[features].mul(coefficients).sum(axis=1),
+    })
+
+
+# ── Model 3: sector regressions ───────────────────────────────────────────────
+
+def run_sector_regressions(panel, features):
+    """Fit one regression per sector, skipping sectors with too little data to mean anything."""
+    data = estimation_rows(panel)
+    data = data.assign(Excess=data["ForwardReturn"] - data.groupby("Date")["ForwardReturn"].transform("mean"))
     results = []
-    df = X.copy()
-    df["ForwardReturn"] = y.values
-    df["Sector"]        = meta["Sector"].values
 
-    for sector, group in df.groupby("Sector"):
-        if len(group) < 10:
+    for sector, group in data.groupby("Sector"):
+        if len(group) < MIN_OBS_PER_FEATURE * len(features):
+            print(f"  Skipping {sector}: {len(group)} observations for {len(features)} features")
             continue
-        X_s = group[FEATURES].dropna()
-        y_s = group.loc[X_s.index, "ForwardReturn"]
-        if X_s.empty:
-            continue
-        try:
-            model = sm.OLS(y_s, sm.add_constant(X_s)).fit()
-            best  = FEATURES[np.argmax(np.abs(model.params[1:].values))]
-            results.append({
-                "Sector":        sector,
-                "R2":            model.rsquared,
-                "AdjR2":         model.rsquared_adj,
-                "N":             len(y_s),
-                "BestPredictor": best,
-            })
-        except Exception as e:
-            print(f"Skipping {sector}: {e}")
+        model = sm.OLS(group["Excess"], sm.add_constant(group[features])).fit()
+        t_values = model.tvalues[features]
+        strongest = t_values.abs().idxmax()
+        results.append({
+            "Sector": sector,
+            "R2": model.rsquared,
+            "AdjR2": model.rsquared_adj,
+            "N": len(group),
+            "StrongestFeature": strongest,
+            "StrongestT": t_values[strongest],
+        })
 
-    return pd.DataFrame(results).sort_values("R2", ascending=False)
-
-
-# ── Save to MongoDB ───────────────────────────────────────────────────────────
-
-def save_to_mongo(db, collection_name, df):
-    col = db[collection_name]
-    col.drop()
-    records = df.copy()
-    # Convert bool columns to plain Python bool for MongoDB
-    for c in records.select_dtypes(include="bool").columns:
-        records[c] = records[c].astype(bool)
-    records = records.to_dict("records")
-    if records:
-        col.insert_many(records)
-    print(f"✅ Saved {len(records)} rows to MongoDB:{collection_name}")
-
-
-def export_csvs(ols_coef, ols_pred, fm_quarterly, fm_summary, sector_results):
-    os.makedirs("output", exist_ok=True)
-    ols_coef.to_csv("output/ols_coefficients.csv",       index=False)
-    ols_pred.to_csv("output/ols_predictions.csv",        index=False)
-    fm_quarterly.to_csv("output/fm_quarterly_coefs.csv", index=False)
-    fm_summary.to_csv("output/fm_summary.csv",           index=False)
-    sector_results.to_csv("output/sector_r2.csv",        index=False)
-    print("✅ CSVs exported to output/")
+    columns = ["Sector", "R2", "AdjR2", "N", "StrongestFeature", "StrongestT"]
+    return pd.DataFrame(results, columns=columns).sort_values("AdjR2", ascending=False)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def load_inputs(db):
+    def read(name):
+        return pd.DataFrame(list(db[name].find({"Ticker": {"$in": TICKERS}}, {"_id": 0})))
+
+    quarterly, fundamentals = read("CompanyQuarterlyData"), read("Fundamentals")
+    if quarterly.empty or fundamentals.empty:
+        raise RuntimeError("Fundamental data is missing. Run: python main.py fetch")
+    return quarterly, fundamentals, load_history(db)
+
+
 def run_regression():
     db = get_database()
+    quarterly, fundamentals, history = load_inputs(db)
+    raw_panel = build_panel(quarterly, fundamentals, history)
 
-    print("Loading data...")
-    df = load_data(db)
+    outputs = {
+        name: []
+        for name in ["OLS_Coefficients", "OLS_Predictions", "FM_QuarterlyCoefs", "FM_Summary", "OOS_Windows", "OOS_Summary"]
+    }
+    oos_by_spec, summaries, panels = {}, {}, {}
 
-    print(f"Dataset size before cleaning: {len(df)}")
-    X, y, meta = build_dataset(df)
-    print(f"Dataset size after cleaning:  {len(X)}")
+    for spec, features in SPECS.items():
+        panel = standardize(raw_panel, features)
+        data = estimation_rows(panel)
+        print(f"\n── Spec '{spec}': {len(data)} stock-quarters, {data['Date'].nunique()} dates, {len(features)} features ──")
 
-    if len(X) < 20:
-        print("❌ Not enough data. Run UPDATE_MODE 2 and 3 first.")
-        return
+        ols_coef, ols_pred = run_pooled_ols(panel, features)
+        fm_coefs, fm_summary = run_fama_macbeth(panel, features)
+        windows = walk_forward(panel, features)
+        oos = summarize_walk_forward(windows, fm_coefs["R2"].mean())
 
-    # ── OLS ──
-    print("\n── OLS Regression ──")
-    ols_model = run_ols(X, y)
-    ols_coef  = ols_results_for_mongo(ols_model, FEATURES)
+        print("Fama-MacBeth (return per 1 SD of the feature):")
+        print(fm_summary[["Feature", "MeanCoef", "T_Stat", "PValue", "QValue"]].to_string(index=False))
+        print("Walk-forward:", {k: round(float(v), 4) for k, v in oos.items()})
 
-    X_const   = sm.add_constant(X)
-    ols_pred  = meta.copy()
-    ols_pred["PredictedReturn"] = ols_model.predict(X_const)
-    ols_pred["ActualReturn"]    = y.values
-    ols_pred["Residual"]        = ols_pred["ActualReturn"] - ols_pred["PredictedReturn"]
-    ols_pred["QuarterDate"]     = ols_pred["QuarterDate"].astype(str)
+        for name, frame in [
+            ("OLS_Coefficients", ols_coef), ("OLS_Predictions", ols_pred), ("FM_QuarterlyCoefs", fm_coefs),
+            ("FM_Summary", fm_summary), ("OOS_Windows", windows), ("OOS_Summary", pd.DataFrame([oos])),
+        ]:
+            outputs[name].append(frame.assign(Spec=spec))
+        oos_by_spec[spec], summaries[spec], panels[spec] = oos, fm_summary, panel
 
-    # ── Fama-MacBeth ──
-    print("\n── Fama-MacBeth Regression ──")
-    fm_quarterly, fm_summary = run_fama_macbeth(X, y, meta)
+    print("\n── Sector regressions (full spec) ──")
+    sectors = run_sector_regressions(panels["full"], SPECS["full"])
+    print(sectors.to_string(index=False))
 
-    # ── Sector ──
-    print("\n── Sector Regressions ──")
-    sector_results = run_sector_regressions(X, y, meta)
-    print(sector_results)
+    # Monte Carlo only uses a signal that has held up out of sample.
+    signal = pd.DataFrame(columns=["Ticker", "Date", "PredictedExcessQuarterly", "Spec"])
+    for spec in SPECS:
+        if signal_is_trustworthy(oos_by_spec[spec]):
+            signal = latest_signal(panels[spec], SPECS[spec], summaries[spec]).assign(Spec=spec)
+            print(f"\nSpec '{spec}' passed the out-of-sample check, so it will tilt Monte Carlo drift.")
+            break
+    else:
+        print("\nNo spec passed the out-of-sample check, so Monte Carlo drift will not be tilted.")
 
-    # ── Save to MongoDB ──
-    save_to_mongo(db, "Regression_OLS_Coefficients",  ols_coef)
-    save_to_mongo(db, "Regression_OLS_Predictions",   ols_pred)
-    save_to_mongo(db, "Regression_FM_QuarterlyCoefs", fm_quarterly)
-    save_to_mongo(db, "Regression_FM_Summary",        fm_summary)
-    save_to_mongo(db, "Regression_Sector_R2",         sector_results)
+    tables = {name: pd.concat(frames, ignore_index=True) for name, frames in outputs.items()}
+    tables["Sector_R2"] = sectors
+    tables["Latest_Signal"] = signal
 
-    # ── Export CSV as backup ──
-    if fm_quarterly is not None and fm_summary is not None:
-        export_csvs(ols_coef, ols_pred, fm_quarterly, fm_summary, sector_results)
-
-    print("\n✅ Done.")
-    print("MongoDB collections written:")
-    print("  Regression_OLS_Coefficients")
-    print("  Regression_OLS_Predictions")
-    print("  Regression_FM_QuarterlyCoefs  ← coefficient per quarter")
-    print("  Regression_FM_Summary         ← averaged + t-tested")
-    print("  Regression_Sector_R2")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    for name, table in tables.items():
+        replace_collection(db, f"Regression_{name}", table)
+        table.to_csv(os.path.join(OUTPUT_DIR, f"regression_{name.lower()}.csv"), index=False)
+    print(f"Regression results exported to {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":
